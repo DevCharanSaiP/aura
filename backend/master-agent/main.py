@@ -22,6 +22,8 @@ class VehicleHealth(BaseModel):
     vehicle_id: str
     anomaly_score: float
     subsystems: dict
+    # Optional snapshot of raw sensors that produced this health record
+    sensor_snapshot: dict | None = None
 
 
 def get_db_conn():
@@ -46,12 +48,13 @@ def store_health(health: VehicleHealth):
 
     conn = get_db_conn()
     cur = conn.cursor()
+    sensor_snapshot_json = json.dumps(health.sensor_snapshot) if health.sensor_snapshot else None
     cur.execute(
         """
-        INSERT INTO health_snapshots (vehicle_id, anomaly_score, subsystems)
-        VALUES (%s, %s, %s)
+        INSERT INTO health_snapshots (vehicle_id, anomaly_score, subsystems, sensor_snapshot)
+        VALUES (%s, %s, %s, %s)
         """,
-        (health.vehicle_id, health.anomaly_score, json.dumps(health.subsystems)),
+        (health.vehicle_id, health.anomaly_score, json.dumps(health.subsystems), sensor_snapshot_json),
     )
     conn.commit()
     cur.close()
@@ -133,9 +136,9 @@ def list_vehicles():
         if latest:
             data = json.loads(latest)
             anomaly = float(data.get("anomaly_score", 0.0))
-            if anomaly > 0.5:
+            if anomaly > 0.3:
                 status = "critical"
-            elif anomaly > 0.25:
+            elif anomaly > 0.18:
                 status = "warning"
             else:
                 status = "ok"
@@ -168,11 +171,11 @@ def contact_decision(vehicle_id: str):
     parsed = json.loads(data)
     score = float(parsed.get("anomaly_score", 0.0))
 
-    if score > 0.5:
+    if score > 0.3:
         level = "critical"
         reason = "high_risk_failure_predicted"
         should_contact = True
-    elif score > 0.25:
+    elif score > 0.18:
         level = "warning"
         reason = "moderate_risk_recommend_scheduling"
         should_contact = True
@@ -187,4 +190,58 @@ def contact_decision(vehicle_id: str):
         "severity": level,
         "should_contact": should_contact,
         "reason": reason,
+    }
+
+@app.get("/mfg/summary")
+def mfg_summary():
+    """
+    Simple manufacturing view: counts by status and top risky vehicles.
+    """
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT vehicle_id,
+               anomaly_score,
+               created_at
+        FROM health_snapshots
+        WHERE id IN (
+          SELECT DISTINCT ON (vehicle_id)
+                 id
+          FROM health_snapshots
+          ORDER BY vehicle_id, id DESC
+        )
+        ORDER BY anomaly_score DESC NULLS LAST
+        """
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    vehicles = []
+    counts = {"ok": 0, "warning": 0, "critical": 0, "unknown": 0}
+    for vid, score, ts in rows:
+        level = "unknown"
+        if score is not None:
+            if score > 0.3:
+                level = "critical"
+            elif score > 0.18:
+                level = "warning"
+            else:
+                level = "ok"
+        counts[level] = counts.get(level, 0) + 1
+        vehicles.append(
+            {
+                "vehicle_id": vid,
+                "anomaly_score": float(score) if score is not None else None,
+                "severity": level,
+                "timestamp": ts.isoformat() if ts else None,
+            }
+        )
+
+    top5 = vehicles[:5]
+    return {
+        "counts": counts,
+        "fleet_size": len(vehicles),
+        "top_risk": top5,
     }
