@@ -1,10 +1,17 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
+import { LoginPage } from "./LoginPage";
 
 const API_BASE = "http://127.0.0.1:8000";
+
 function App() {
-  
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [authToken, setAuthToken] = useState(null);
+  const [userRole, setUserRole] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [ownedVehicleId, setOwnedVehicleId] = useState(null);
+  // Only keep fleet state for user role
   const [fleet, setFleet] = useState([]);
-  const [mode, setMode] = useState("user"); // "user" | "service" | "mfg"
+  // Removed mode state as we'll use userRole to determine the view
   const [vehicleId, setVehicleId] = useState("V001");
   const [health, setHealth] = useState(null);
   const [history, setHistory] = useState([]);
@@ -15,34 +22,236 @@ function App() {
   const [schedule, setSchedule] = useState(null);
   const [scheduleLoading, setScheduleLoading] = useState(false);
   const [scheduleError, setScheduleError] = useState("");
+  const [upcomingBookings, setUpcomingBookings] = useState([]);
   const [mfgSummary, setMfgSummary] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  async function fetchFleet() {
-    try {
-      const [fleetRes, mfgRes] = await Promise.all([
-        fetch(`${API_BASE}/vehicles`),
-        fetch(`${API_BASE}/mfg/summary`),
-      ]);
-      const fleetJson = await fleetRes.json();
-      const mfgJson = await mfgRes.json();
-      setFleet(fleetJson.vehicles || []);
-      setMfgSummary(mfgJson);
-    } catch (e) {
-      console.error(e);
+  // Handle login
+  const handleLogin = (data) => {
+    setIsLoggedIn(true);
+    setAuthToken(data.token);
+    setUserRole(data.role);
+    setUserId(data.user_id);
+    
+    // Store in localStorage for persistence
+    localStorage.setItem("aura_token", data.token);
+    localStorage.setItem("aura_role", data.role);
+    localStorage.setItem("aura_user_id", data.user_id);
+    
+    // Extract vehicle ID for car owners
+    if (data.role === "user" && data.user_id.includes("v")) {
+      const vehicleId = data.user_id.substring(data.user_id.length - 4).toUpperCase();
+      setOwnedVehicleId(vehicleId);
+      setVehicleId(vehicleId);
+      localStorage.setItem("aura_vehicle_id", vehicleId);
     }
-  }
+  };
 
-  async function triggerEngagement(id) {
+  // Handle logout
+  const handleLogout = useCallback(() => {
+    console.log("Logging out...");
+    setIsLoggedIn(false);
+    setAuthToken(null);
+    setUserRole(null);
+    setUserId(null);
+    setOwnedVehicleId(null);
+    localStorage.removeItem("aura_token");
+    localStorage.removeItem("aura_role");
+    localStorage.removeItem("aura_user_id");
+    localStorage.removeItem("aura_vehicle_id");
+    console.log("Logged out Successfully");
+  }, []);
+
+  // Memoized fetchFleet to prevent infinite loops
+  const fetchFleet = useCallback(async () => {
+    try {
+      setLoading(true);
+      setError("");
+
+      const headers = authToken ? {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${authToken}`
+      } : {};
+
+      // Only fetch what's needed based on user role
+      const endpoints = [];
+      
+      // In the fetchFleet function, only fetch bookings for service center
+      if (userRole === 'service') {
+        endpoints.push(
+          fetch(`${API_BASE}/bookings/upcoming`, { headers })
+        );
+      } 
+      // Car owner only needs their own vehicle data
+      else if (userRole === 'user' && ownedVehicleId) {
+        endpoints.push(
+          fetch(`${API_BASE}/vehicles/${ownedVehicleId}`, { headers })
+        );
+        // Set the vehicleId to the ownedVehicleId
+        setVehicleId(ownedVehicleId);
+      }
+      // Manufacturing view needs the summary
+      else if (userRole === 'mfg') {
+        endpoints.push(
+          fetch(`${API_BASE}/mfg/summary`, { headers })
+        );
+      }
+
+      if (endpoints.length === 0) return;
+
+      const responses = await Promise.all(endpoints);
+      
+      // Check for any 401 Unauthorized responses
+      if (responses.some(res => res.status === 401)) {
+        throw new Error("Session expired - please login again");
+      }
+      
+      // Process responses based on role
+      if (userRole === 'service') {
+        const [bookingsRes] = responses;
+        const bookingsJson = bookingsRes.ok ? await bookingsRes.json() : { bookings: [] };
+        
+        setUpcomingBookings(bookingsJson.bookings || []);
+      } 
+      else if (userRole === 'user' && ownedVehicleId) {
+        const [vehicleRes] = responses;
+        if (vehicleRes.ok) {
+          const vehicleData = await vehicleRes.json();
+          setFleet([vehicleData]); // Store as array for compatibility with existing code
+        }
+      }
+      else if (userRole === 'mfg') {
+        const [mfgRes] = responses;
+        if (mfgRes.ok) {
+          const mfgJson = await mfgRes.json();
+          setMfgSummary(mfgJson);
+        }
+      }
+    } catch (e) {
+      console.error("Fetch error:", e);
+      if (e.message.includes("Session expired") || e.message.includes("Unauthorized")) {
+        handleLogout();
+      } else {
+        setError("Failed to load data. Please try again.");
+      }
+    } finally {
+      setLoading(false);
+    }
+  }, [authToken]);
+
+  // Check for existing session on mount
+  const validateToken = useCallback(async () => {
+    const savedToken = localStorage.getItem("aura_token");
+    const savedRole = localStorage.getItem("aura_role");
+    const savedUserId = localStorage.getItem("aura_user_id");
+    
+    // If any auth data is missing, log out
+    if (!savedToken || !savedRole || !savedUserId) {
+      console.log("Missing auth data in localStorage");
+      handleLogout();
+      return;
+    }
+
+    try {
+      console.log("Validating token...");
+      const res = await fetch(`${API_BASE}/auth/validate?token=${savedToken}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${savedToken}`
+        },
+      });
+
+      if (res.status === 422) {
+        const errorData = await res.json();
+        console.error("Validation error:", errorData);
+        throw new Error(`Validation failed: ${JSON.stringify(errorData)}`);
+      }
+
+      if (!res.ok) {
+        throw new Error(`HTTP error! status: ${res.status}`);
+      }
+
+      const data = await res.json();
+      console.log("Token validation response:", data);
+
+      if (!data.valid) {
+        throw new Error("Invalid token");
+      }
+
+      // If we get here, token is valid - update state
+      console.log("Token is valid, updating state...");
+      setAuthToken(savedToken);
+      setUserRole(savedRole);
+      setUserId(savedUserId);
+      setIsLoggedIn(true);
+      
+      // Set vehicle ID if it exists
+      const savedVehicleId = localStorage.getItem("aura_vehicle_id");
+      if (savedVehicleId) {
+        setOwnedVehicleId(savedVehicleId);
+        setVehicleId(savedVehicleId);
+      }
+
+    } catch (e) {
+      console.error("Token validation error:", e);
+      handleLogout();
+    }
+  }, []);
+
+  // Validate token on mount and when logged in state changes
+  useEffect(() => {
+    if (isLoggedIn) {
+      validateToken();
+    }
+  }, [isLoggedIn, validateToken]);
+
+  useEffect(() => {
+    validateToken();
+  }, [validateToken]);
+
+  // Fetch data when authenticated and authToken is ready
+  useEffect(() => {
+    if (isLoggedIn && authToken) {
+      // Only fetch fleet data if user has permission
+      const timer = setTimeout(() => {
+        if (userRole === 'user' || userRole === 'service') {
+          fetchFleet();
+        }
+      }, 100);
+      
+      // Set up polling only for service center view
+      let interval;
+      if (userRole === 'service') {
+        interval = setInterval(() => {
+          fetchFleet();
+        }, 3000);
+      }
+      
+      return () => {
+        clearTimeout(timer);
+        if (interval) clearInterval(interval);
+      };
+    }
+  }, [isLoggedIn, authToken, fetchFleet, userRole]);
+
+  const triggerEngagement = useCallback(async (id) => {
     try {
       setEngagementLoading(true);
       setEngagementError("");
       setEngagement(null);
 
+      const headers = {
+        "Content-Type": "application/json",
+      };
+      if (authToken) {
+        headers["Authorization"] = `Bearer ${authToken}`;
+      }
+
       const res = await fetch("http://127.0.0.1:8200/simulate_call", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({
           vehicle_id: id,
           owner_name: "Techathon User",
@@ -58,17 +267,24 @@ function App() {
     } finally {
       setEngagementLoading(false);
     }
-  }
+  }, [authToken]);
 
-  async function triggerSchedule(id) {
+  const triggerSchedule = useCallback(async (id) => {
     try {
       setScheduleLoading(true);
       setScheduleError("");
       setSchedule(null);
 
+      const headers = {
+        "Content-Type": "application/json",
+      };
+      if (authToken) {
+        headers["Authorization"] = `Bearer ${authToken}`;
+      }
+
       const res = await fetch("http://127.0.0.1:8300/propose_slots", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({
           vehicle_id: id,
           owner_name: "Techathon User",
@@ -83,17 +299,73 @@ function App() {
     } finally {
       setScheduleLoading(false);
     }
-  }
+  }, [authToken]);
 
-  async function fetchData(id) {
+  const confirmBooking = useCallback(async (vehicleId, slotStart, slotEnd) => {
+    try {
+      const headers = {
+        "Content-Type": "application/json",
+      };
+      if (authToken) {
+        headers["Authorization"] = `Bearer ${authToken}`;
+      }
+
+      const res = await fetch(`${API_BASE}/bookings/confirm`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          vehicle_id: vehicleId,
+          slot_start: slotStart,
+          slot_end: slotEnd,
+          center_id: "SVC_CENTER_001",
+        }),
+      });
+
+      const json = await res.json();
+      if (json.success) {
+        alert(`✓ Booking confirmed for ${slotStart}`);
+        triggerSchedule(vehicleId);
+        fetchFleet();
+      } else {
+        alert(`✗ Failed to confirm booking: ${json.error}`);
+      }
+    } catch (e) {
+      console.error(e);
+      alert("Failed to confirm booking");
+    }
+  }, [authToken, triggerSchedule, fetchFleet]);
+
+  const fetchData = useCallback(async (id) => {
     try {
       setLoading(true);
       setError("");
+
+      // Only car owners can view detailed health data
+      if (userRole !== "user") {
+        setError("Only vehicle owners can view detailed health data");
+        setHealth(null);
+        setHistory([]);
+        setContactDecision(null);
+        return;
+      }
+
+      const headers = authToken ? {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${authToken}`
+      } : {};
+
       const [healthRes, histRes, contactRes] = await Promise.all([
-        fetch(`${API_BASE}/health/${id}`),
-        fetch(`${API_BASE}/history/${id}?limit=20`),
-        fetch(`${API_BASE}/contact_decision/${id}`),
+        fetch(`${API_BASE}/health/${id}`, { headers }),
+        fetch(`${API_BASE}/history/${id}?limit=20`, { headers }),
+        fetch(`${API_BASE}/contact_decision/${id}`, { headers }),
       ]);
+
+      if (!healthRes.ok || !histRes.ok || !contactRes.ok) {
+        if (healthRes.status === 403 || histRes.status === 403 || contactRes.status === 403) {
+          throw new Error("Unauthorized access - wrong vehicle");
+        }
+        throw new Error(`HTTP ${healthRes.status}`);
+      }
 
       const healthJson = await healthRes.json();
       const histJson = await histRes.json();
@@ -104,23 +376,31 @@ function App() {
       setContactDecision(contactJson);
     } catch (e) {
       console.error(e);
-      setError("Failed to load data from backend");
+      setError(e.message || "Failed to load data from backend");
+      if (e.message.includes("Unauthorized")) {
+        handleLogout();
+      }
     } finally {
       setLoading(false);
     }
-  }
+  }, [authToken, userRole, handleLogout]);
 
   useEffect(() => {
-    fetchData(vehicleId);
-    fetchFleet();
-    const interval = setInterval(() => {
+    if (isLoggedIn && authToken && userRole === "user") {
       fetchData(vehicleId);
-      fetchFleet();
-  }, 3000);
-    return () => clearInterval(interval);
-  }, [vehicleId]);
+      const interval = setInterval(() => {
+        fetchData(vehicleId);
+      }, 3000);
+      return () => clearInterval(interval);
+    }
+  }, [vehicleId, isLoggedIn, authToken, userRole, fetchData]);
 
   // Keep health parsing inside UserView so views remain self-contained
+
+  // Show login page if not authenticated
+  if (!isLoggedIn) {
+    return <LoginPage onLogin={handleLogin} />;
+  }
 
   return (
     <div style={{ padding: "1.5rem 2rem" }}>
@@ -130,35 +410,33 @@ function App() {
       <p style={{ marginBottom: "1rem", color: "#9ca3af" }}>
         Live vehicle health from Master Agent (V001–V010).
       </p>
-      {/* Role switcher */}
-      <div style={{ marginBottom: "1rem", display: "flex", gap: "0.5rem" }}>
-        {[
-          { id: "user", label: "Car Owner" },
-          { id: "service", label: "Service Center" },
-          { id: "mfg", label: "Manufacturing" },
-        ].map((m) => (
-          <button
-            key={m.id}
-            onClick={() => setMode(m.id)}
-            style={{
-              padding: "0.35rem 0.75rem",
-              borderRadius: "999px",
-              border: mode === m.id ? "2px solid #e5e7eb" : "1px solid #4b5563",
-              background: mode === m.id ? "#111827" : "#020617",
-              color: "#e5e7eb",
-              cursor: "pointer",
-              fontSize: "0.85rem",
-            }}
-          >
-            {m.label}
-          </button>
-        ))}
+      {/* Logout button in top right */}
+      <div style={{ position: "absolute", top: "1.5rem", right: "2rem" }}>
+        <button
+          onClick={handleLogout}
+          style={{
+            padding: "0.5rem 1rem",
+            backgroundColor: "#ef4444",
+            color: "#fff",
+            border: "none",
+            borderRadius: "0.375rem",
+            cursor: "pointer",
+            fontSize: "0.875rem",
+            fontWeight: 500,
+          }}
+        >
+          Logout
+        </button>
+      </div>
+      {/* User info */}
+      <div style={{ marginBottom: "1rem", padding: "0.75rem", backgroundColor: "#374151", borderRadius: "0.375rem", color: "#d1d5db", fontSize: "0.875rem" }}>
+        Logged in as <strong>{userId}</strong> ({userRole === "user" ? "Car Owner" : userRole === "service" ? "Service Center" : "Manufacturing"})
       </div>
 
-      {mode === "user" && (
+      {/* Show only the view for the current user's role */}
+      {userRole === "user" ? (
         <UserView
           vehicleId={vehicleId}
-          setVehicleId={setVehicleId}
           fleet={fleet}
           health={health}
           history={history}
@@ -174,11 +452,13 @@ function App() {
           loading={loading}
           error={error}
         />
+      ) : userRole === "service" ? (
+        <ServiceCenterView 
+          upcomingBookings={upcomingBookings} 
+        />
+      ) : (
+        <ManufacturingView summary={mfgSummary} />
       )}
-
-      {mode === "service" && <ServiceCenterView fleet={fleet} />}
-
-      {mode === "mfg" && <ManufacturingView summary={mfgSummary} />}
     </div>
   );
 }
@@ -186,7 +466,6 @@ function App() {
 function UserView(props) {
   const {
     vehicleId,
-    setVehicleId,
     fleet,
     health,
     history,
@@ -207,34 +486,6 @@ function UserView(props) {
 
   return (
     <div>
-
-      <div style={{ marginBottom: "1rem" }}>
-        <label>
-          Vehicle ID:&nbsp;
-          <select
-            value={vehicleId}
-            onChange={(e) => setVehicleId(e.target.value)}
-            style={{
-              padding: "0.25rem 0.5rem",
-              borderRadius: "0.375rem",
-              border: "1px solid #4b5563",
-              background: "#020617",
-              color: "#e5e7eb",
-            }}
-          >
-            {Array.from({ length: 10 }).map((_, i) => {
-              const num = i + 1;
-              const id = `V${num.toString().padStart(3, "0")}`;
-              return (
-                <option key={id} value={id}>
-                  {id}
-                </option>
-              );
-            })}
-          </select>
-        </label>
-      </div>
-
       {loading && (
         <div style={{ marginBottom: "0.5rem", color: "#e5e7eb" }}>Loading…</div>
       )}
@@ -243,56 +494,39 @@ function UserView(props) {
       )}
 
       <div style={{ display: "flex", gap: "1.5rem", alignItems: "flex-start", flexWrap: "wrap" }}>
-        {/* Fleet overview */}
-        <div
-          style={{
-            marginBottom: "1.5rem",
-            padding: "1rem",
-            borderRadius: "0.75rem",
-            background: "#020617",
-            border: "1px solid #1f2937",
-            minWidth: "220px",
-          }}
-        >
-          <h2 style={{ fontWeight: 600, marginBottom: "0.5rem" }}>Fleet Overview</h2>
-          {fleet.length === 0 ? (
-            <p style={{ fontSize: "0.9rem", color: "#9ca3af" }}>No vehicles yet.</p>
-          ) : (
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(120px, 1fr))", gap: "0.5rem" }}>
-              {fleet.map((v) => {
-                let bg = "#064e3b";
-                if (v.status === "warning") bg = "#78350f";
-                if (v.status === "critical") bg = "#7f1d1d";
-                const selected = v.vehicle_id === vehicleId;
-                return (
-                  <button
-                    key={v.vehicle_id}
-                    onClick={() => setVehicleId(v.vehicle_id)}
-                    style={{ textAlign: "left", padding: "0.5rem 0.6rem", borderRadius: "0.5rem", border: selected ? "2px solid #e5e7eb" : "1px solid #1f2937", background: bg, color: "#e5e7eb", cursor: "pointer", fontSize: "0.85rem" }}
-                  >
-                    <div style={{ fontWeight: 600 }}>{v.vehicle_id}</div>
-                    <div style={{ fontSize: "0.8rem" }}>
-                      Anom: {v.anomaly_score !== null && v.anomaly_score !== undefined ? v.anomaly_score.toFixed(2) : "--"}
-                    </div>
-                    <div style={{ fontSize: "0.75rem", textTransform: "capitalize", color: "#e5e7eb" }}>{v.status}</div>
-                  </button>
-                );
-              })}
-            </div>
-          )}
-        </div>
 
         {/* Main column: current health, contact decision, engagement, schedule, history */}
         <div style={{ flex: "1 1 520px", minWidth: "320px" }}>
           {/* Current health card */}
           <div style={{ padding: "1rem", borderRadius: "0.75rem", background: current && current.anomaly_score > 0.5 ? "#7f1d1d" : current && current.anomaly_score > 0.25 ? "#78350f" : "#064e3b", minWidth: "260px" }}>
-            <h2 style={{ fontWeight: 600, marginBottom: "0.5rem" }}>Current Health – {vehicleId}</h2>
+            <h2 style={{ fontWeight: 600, marginBottom: "0.5rem" }}>Vehicle Health Status</h2>
             {current ? (
               <>
-                <p style={{ marginBottom: "0.25rem" }}>Anomaly score: <strong>{current.anomaly_score.toFixed(2)}</strong></p>
-                <p style={{ marginBottom: "0.25rem" }}>Brakes: <strong>{current.subsystems.brakes?.toFixed(2)}</strong></p>
-                <p style={{ marginBottom: "0.25rem" }}>Engine: <strong>{current.subsystems.engine?.toFixed(2)}</strong></p>
-                <p style={{ marginBottom: "0.25rem" }}>Suspension: <strong>{current.subsystems.suspension?.toFixed(2)}</strong></p>
+                <p style={{ marginBottom: "0.5rem" }}>
+                  <strong style={{ color: "#fbbf24" }}>Overall Score:</strong> {current.anomaly_score?.toFixed(2) || "--"}
+                </p>
+
+                {/* Rule-based scoring section */}
+                <div style={{ fontSize: "0.85rem", color: "#d1d5db", marginBottom: "0.5rem", paddingLeft: "0.5rem", borderLeft: "2px solid #3b82f6" }}>
+                  <p style={{ margin: "0.15rem 0", fontWeight: 500 }}>Rule-Based (70%):</p>
+                  <p style={{ margin: "0.1rem 0" }}>Score: <strong>{current.rule_anomaly_score?.toFixed(2) || "--"}</strong></p>
+                  <p style={{ margin: "0.1rem 0" }}>Brakes: <strong>{current.subsystems?.brakes?.toFixed(2) || "--"}</strong></p>
+                  <p style={{ margin: "0.1rem 0" }}>Engine: <strong>{current.subsystems?.engine?.toFixed(2) || "--"}</strong></p>
+                  <p style={{ margin: "0.1rem 0" }}>Suspension: <strong>{current.subsystems?.suspension?.toFixed(2) || "--"}</strong></p>
+                </div>
+
+                {/* ML-based scoring section */}
+                <div style={{ fontSize: "0.85rem", color: "#d1d5db", paddingLeft: "0.5rem", borderLeft: "2px solid #8b5cf6" }}>
+                  <p style={{ margin: "0.15rem 0", fontWeight: 500 }}>ML-Based (30%) – Isolation Forest:</p>
+                  <p style={{ margin: "0.1rem 0" }}>
+                    Score: <strong>{current.ml_anomaly_score?.toFixed(2) || "--"}</strong>
+                  </p>
+                  <p style={{ margin: "0.1rem 0" }}>
+                    Decision: <strong style={{ textTransform: "uppercase", color: current.ml_label === "anomaly" ? "#f87171" : "#86efac" }}>
+                      {current.ml_label || "unknown"}
+                    </strong>
+                  </p>
+                </div>
               </>
             ) : (
               <p>No data yet.</p>
@@ -346,9 +580,35 @@ function UserView(props) {
                 {!schedule ? (
                   <p style={{ fontSize: "0.8rem", color: "#9ca3af" }}>Click "Propose Slots" to see options based on risk.</p>
                 ) : !schedule.can_schedule ? (
-                  <p style={{ fontSize: "0.8rem", color: "#9ca3af" }}>Cannot schedule now: {schedule.reason}</p>
+                  <p style={{ fontSize: "0.8rem", color: "#9ca3af" }}>Cannot schedule now: {schedule.reason}{schedule.total_suggested && ` (${schedule.available}/${schedule.total_suggested} available)`}</p>
                 ) : (
-                  <ul style={{ fontSize: "0.8rem", paddingLeft: "1rem" }}>{schedule.options.map((opt, idx) => (<li key={idx} style={{ marginBottom: "0.3rem" }}>{opt.label}</li>))}</ul>
+                  <div style={{ fontSize: "0.8rem" }}>
+                    {schedule.total_suggested && (
+                      <p style={{ fontSize: "0.75rem", color: "#d1fae5", marginBottom: "0.3rem" }}>
+                        ✓ {schedule.available} of {schedule.total_suggested} slots available (others already booked)
+                      </p>
+                    )}
+                    {schedule.options.map((opt, idx) => (
+                      <div key={idx} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.4rem", paddingBottom: "0.3rem", borderBottom: "1px solid #1f2937" }}>
+                        <span>{opt.label}</span>
+                        <button
+                          onClick={() => confirmBooking(vehicleId, opt.slot_start, opt.slot_end)}
+                          style={{
+                            padding: "0.2rem 0.5rem",
+                            fontSize: "0.75rem",
+                            borderRadius: "0.375rem",
+                            border: "1px solid #4b5563",
+                            background: "#065f46",
+                            color: "#d1fae5",
+                            cursor: "pointer",
+                            fontWeight: 500,
+                          }}
+                        >
+                          Confirm
+                        </button>
+                      </div>
+                    ))}
+                  </div>
                 )}
               </div>
             </div>
@@ -369,41 +629,52 @@ function UserView(props) {
   );
 }
 
-function ServiceCenterView({ fleet }) {
-  const total = fleet.length;
-  const warning = fleet.filter((v) => v.status === "warning").length;
-  const critical = fleet.filter((v) => v.status === "critical").length;
-  const ok = fleet.filter((v) => v.status === "ok").length;
-
+function ServiceCenterView({ upcomingBookings }) {
   return (
     <div style={{ color: "#e5e7eb" }}>
       <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
-        <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap" }}>
-          <SummaryCard label="Total vehicles" value={total} />
-          <SummaryCard label="Critical risk" value={critical} color="#7f1d1d" />
-          <SummaryCard label="Warning risk" value={warning} color="#78350f" />
-          <SummaryCard label="Healthy" value={ok} color="#064e3b" />
+        <div style={{ padding: "1rem", borderRadius: "0.75rem", background: "#1e293b", border: "1px solid #334155" }}>
+          <h2 style={{ fontWeight: 600, marginBottom: "0.5rem" }}>Service Center Dashboard</h2>
+          <p style={{ fontSize: "0.9rem", color: "#cbd5e1" }}>
+            This view shows upcoming service appointments. Vehicle health data will be available 
+            through the customer agent after a booking is confirmed.
+          </p>
         </div>
 
+        {/* Upcoming AURA Bookings */}
         <div style={{ padding: "1rem", borderRadius: "0.75rem", background: "#020617", border: "1px solid #1f2937" }}>
-          <h2 style={{ fontWeight: 600, marginBottom: "0.5rem" }}>Live Risk Board</h2>
-          {fleet.length === 0 ? (
-            <p style={{ fontSize: "0.9rem", color: "#9ca3af" }}>No vehicles loaded yet.</p>
+          <h2 style={{ fontWeight: 600, marginBottom: "0.5rem" }}>Upcoming AURA Bookings</h2>
+          {upcomingBookings.length === 0 ? (
+            <p style={{ fontSize: "0.9rem", color: "#9ca3af" }}>No confirmed bookings yet.</p>
           ) : (
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.85rem" }}>
               <thead>
                 <tr style={{ borderBottom: "1px solid #1f2937" }}>
                   <th style={{ textAlign: "left", padding: "0.5rem" }}>Vehicle</th>
-                  <th style={{ textAlign: "left", padding: "0.5rem" }}>Anomaly</th>
+                  <th style={{ textAlign: "left", padding: "0.5rem" }}>Date / Time</th>
+                  <th style={{ textAlign: "left", padding: "0.5rem" }}>Service Center</th>
                   <th style={{ textAlign: "left", padding: "0.5rem" }}>Status</th>
                 </tr>
               </thead>
               <tbody>
-                {fleet.map((v) => (
-                  <tr key={v.vehicle_id} style={{ borderBottom: "1px solid #020617" }}>
-                    <td style={{ padding: "0.4rem 0.5rem" }}>{v.vehicle_id}</td>
-                    <td style={{ padding: "0.4rem 0.5rem" }}>{v.anomaly_score != null ? v.anomaly_score.toFixed(2) : "--"}</td>
-                    <td style={{ padding: "0.4rem 0.5rem", textTransform: "capitalize" }}>{v.status}</td>
+                {upcomingBookings.map((booking) => (
+                  <tr key={booking.booking_id} style={{ borderBottom: "1px solid #020617" }}>
+                    <td style={{ padding: "0.4rem 0.5rem", fontWeight: 500 }}>{booking.vehicle_id}</td>
+                    <td style={{ padding: "0.4rem 0.5rem" }}>
+                      {booking.slot_start
+                        ? new Date(booking.slot_start).toLocaleString("en-IN", {
+                            year: "numeric",
+                            month: "short",
+                            day: "numeric",
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          })
+                        : "--"}
+                    </td>
+                    <td style={{ padding: "0.4rem 0.5rem" }}>{booking.center_id || "TBD"}</td>
+                    <td style={{ padding: "0.4rem 0.5rem", textTransform: "capitalize", color: booking.status === "confirmed" ? "#86efac" : "#9ca3af" }}>
+                      {booking.status}
+                    </td>
                   </tr>
                 ))}
               </tbody>

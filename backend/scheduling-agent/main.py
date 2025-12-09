@@ -3,8 +3,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import datetime as dt
 import requests
+import psycopg2
 
 MASTER_URL = "http://127.0.0.1:8000/contact_decision"
+DB_HOST = "localhost"
+DB_PORT = 5432
+DB_NAME = "aura"
+DB_USER = "postgres"
+DB_PASS = "postgres"
 
 app = FastAPI(title="AURA Scheduling Agent - Stub v0")
 
@@ -24,9 +30,61 @@ class ScheduleRequest(BaseModel):
     center_id: str | None = "CENTER_MUMBAI_01"
 
 
+def get_booked_slots(vehicle_id: str):
+    """
+    Fetch confirmed bookings for a vehicle from the database.
+    Returns list of (slot_start, slot_end) tuples.
+    """
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASS,
+        )
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT slot_start, slot_end
+            FROM bookings
+            WHERE vehicle_id = %s AND status = 'confirmed'
+            """,
+            (vehicle_id,),
+        )
+        booked = cur.fetchall()
+        cur.close()
+        conn.close()
+        return booked
+    except Exception as e:
+        print(f"Error fetching booked slots: {e}")
+        return []
+
+
+def slot_is_available(slot_start_iso: str, slot_end_iso: str, booked_slots):
+    """
+    Check if a proposed slot conflicts with any confirmed booking.
+    Returns True if available, False if overlaps with a booking.
+    """
+    from datetime import datetime
+    
+    try:
+        slot_start = datetime.fromisoformat(slot_start_iso)
+        slot_end = datetime.fromisoformat(slot_end_iso)
+        
+        for booked_start, booked_end in booked_slots:
+            # Check for overlap: if slot overlaps with any booked slot, it's unavailable
+            if slot_start < booked_end and slot_end > booked_start:
+                return False
+        return True
+    except Exception as e:
+        print(f"Error checking slot availability: {e}")
+        return True  # default to available if error
+
+
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "scheduling-agent", "version": "0.0.1"}
+    return {"status": "ok", "service": "scheduling-agent", "version": "0.0.2"}
 
 
 def generate_slots(days: int, severity: str):
@@ -79,11 +137,32 @@ def propose_slots(req: ScheduleRequest):
             "decision": decision,
         }
 
+    # Filter out already-booked slots
+    booked_slots = get_booked_slots(req.vehicle_id)
+    available_slots = [
+        slot for slot in slots
+        if slot_is_available(slot["start"], slot["end"], booked_slots)
+    ]
+
+    if not available_slots:
+        return {
+            "vehicle_id": req.vehicle_id,
+            "center_id": req.center_id,
+            "severity": severity,
+            "can_schedule": False,
+            "reason": "all_suggested_slots_already_booked",
+            "decision": decision,
+            "total_suggested": len(slots),
+            "available": len(available_slots),
+        }
+
     return {
         "vehicle_id": req.vehicle_id,
         "center_id": req.center_id,
         "severity": severity,
         "can_schedule": True,
         "decision": decision,
-        "options": slots,
+        "options": available_slots,
+        "total_suggested": len(slots),
+        "available": len(available_slots),
     }

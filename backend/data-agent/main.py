@@ -9,11 +9,12 @@ import os
 MASTER_URL = "http://127.0.0.1:8000/store_health"
 
 # Load the trained ML model
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "isoforest.pkl")
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "isoforest.pkl")
 ML_MODEL = None
 try:
     if os.path.exists(MODEL_PATH):
         ML_MODEL = joblib.load(MODEL_PATH)
+        print(f"✓ ML model loaded from {MODEL_PATH}")
     else:
         print(f"Warning: ML model not found at {MODEL_PATH}. ML scoring will be skipped.")
 except Exception as e:
@@ -63,20 +64,26 @@ def compute_ml_anomaly(sensors: dict) -> tuple[float, str]:
             row.append(float(val))
         X = np.array([row], dtype=np.float32)
         
-        # Score: -1 is anomaly, 1 is normal
+        # Get prediction: -1 is anomaly, 1 is normal
         prediction = ML_MODEL.predict(X)[0]
-        # Get anomaly score (higher = more anomalous)
-        anomaly_score_raw = ML_MODEL.score_samples(X)[0]
         
-        # Normalize to [0, 1] where 1 is most anomalous
-        # score_samples returns negative scores; invert and normalize
-        # Typical range is roughly [-10, 0]; map to [0, 1]
-        anomaly_score = max(0.0, min(1.0, -anomaly_score_raw / 10.0))
+        # Get decision function score (distance from separation hyperplane)
+        # Higher = more normal, Lower = more anomalous
+        # Typical range: roughly [-0.5, 0.5] but can vary
+        df_score = ML_MODEL.decision_function(X)[0]
+        
+        # Map decision function to [0, 1] anomaly scale
+        # df_score > 0.2 => normal (0.0)
+        # df_score < -0.2 => anomaly (1.0)
+        # Linear mapping between
+        anomaly_score = max(0.0, min(1.0, 0.5 - df_score * 2.5))
         
         label = "anomaly" if prediction == -1 else "normal"
         return round(anomaly_score, 2), label
     except Exception as e:
         print(f"Error computing ML anomaly: {e}")
+        import traceback
+        traceback.print_exc()
         return 0.0, "error"
 
 
