@@ -1,6 +1,6 @@
 # AURA
 
-AURA is a prototype predictive vehicle-health and maintenance platform. It simulates vehicle telemetry, scores potential issues with rule-based checks and an optional Isolation Forest model, and presents health and maintenance information in a role-based web dashboard.
+AURA is a multi-agent predictive vehicle-health and maintenance platform (prototype). It simulates vehicle telemetry, scores potential issues with rule-based checks and an optional Isolation Forest model, and presents health and maintenance information in a role-based web dashboard.
 
 ## What it includes
 
